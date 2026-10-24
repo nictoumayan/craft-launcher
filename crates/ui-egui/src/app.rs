@@ -58,6 +58,13 @@ pub trait Host {
     fn reduce_motion(&self) -> bool {
         false
     }
+    fn pick_folder(&mut self, _initial: Option<&str>) -> Option<String> {
+        None
+    }
+    /// The URL to open when Discord is clicked. Defaults to the web link.
+    fn discord_url(&self) -> &'static str {
+        artcraft_launcher_core::catalog::DISCORD_URL
+    }
     /// Quit the launcher for real (not just hide to the tray).
     fn quit(&mut self) {}
 }
@@ -72,6 +79,8 @@ pub(crate) struct Toast {
 pub(crate) enum Dialog {
     Notes(String),
     ConfirmUninstall(String),
+    Install { app: String, folder: String },
+    Replace { app: String, path: String },
     Settings,
     LauncherUpdate(artcraft_launcher_core::Release),
 }
@@ -83,6 +92,8 @@ impl Dialog {
         match self {
             Dialog::Notes(id) => ("notes", id),
             Dialog::ConfirmUninstall(id) => ("uninstall", id),
+            Dialog::Install { app, .. } => ("install", app),
+            Dialog::Replace { app, .. } => ("replace", app),
             Dialog::Settings => ("settings", ""),
             Dialog::LauncherUpdate(r) => ("launcher-update", &r.tag),
         }
@@ -110,6 +121,8 @@ pub struct LauncherUi {
     pub(crate) search: String,
     pub(crate) toasts: Vec<Toast>,
     pub(crate) dialog: Option<Dialog>,
+    /// Release-note text scale for this session, independent of the main UI zoom.
+    pub(crate) notes_zoom: f32,
     /// The app whose details drawer is open (or closing: see `detail_shown`).
     pub(crate) detail: Option<String>,
     /// The app the drawer is drawn for: it outlives `detail` while the drawer slides out.
@@ -142,6 +155,8 @@ pub struct LauncherUi {
     /// Versions of apps or the launcher already queued for auto-update during this session,
     /// preventing repeated install loops if an update fails or is in progress.
     pub(crate) auto_update_attempted: std::collections::BTreeSet<(String, String)>,
+    /// The URL or deep link to open when Discord is clicked.
+    pub(crate) discord_url: &'static str,
 }
 
 /// The language to draw in: the preference, or English where it needs a CJK font the system
@@ -166,6 +181,8 @@ impl LauncherUi {
         egui_extras::install_image_loaders(ctx);
         let caps = backend.capabilities();
         let platform = backend.platform();
+        let mut settings = settings;
+        settings.migrate();
         Self {
             backend,
             settings,
@@ -183,6 +200,7 @@ impl LauncherUi {
             search: String::new(),
             toasts: Vec::new(),
             dialog: None,
+            notes_zoom: 1.0,
             detail: None,
             detail_shown: None,
             detail_shot: 0,
@@ -199,6 +217,7 @@ impl LauncherUi {
             last_detect: 0,
             was_focused: true,
             auto_update_attempted: std::collections::BTreeSet::new(),
+            discord_url: artcraft_launcher_core::catalog::DISCORD_URL,
         }
     }
 
@@ -263,14 +282,39 @@ impl LauncherUi {
         self.entries.iter_mut().find(|e| e.app.id == id)
     }
 
-    /// Non-drawing work: runs every frame and also while the window is hidden in the tray.
-    pub fn logic(&mut self, ctx: &egui::Context, host: &mut dyn Host) {
-        set_current(crate::i18n::Lang::from_pref(&self.settings.language));
-        let options = BackendOptions { kinds: self.settings.preferred_kinds.clone(), prereleases: self.settings.prereleases };
+    pub(crate) fn configure(&mut self) {
+        let options = BackendOptions {
+            kinds: self.settings.preferred_kinds.clone(),
+            prereleases: self.settings.prereleases,
+            install_locations: self.settings.install_locations.clone(),
+        };
         if self.sent_options.as_ref() != Some(&options) {
             self.backend.send(Command::Configure(options.clone()));
             self.sent_options = Some(options);
         }
+    }
+
+    pub(crate) fn custom_install_folders(&self) -> bool {
+        self.caps.manage_apps
+            && self.platform.is_some_and(|p| {
+                matches!(p.os, artcraft_launcher_core::Os::Windows | artcraft_launcher_core::Os::MacOs | artcraft_launcher_core::Os::Linux)
+            })
+            && !crate::settings::is_flatpak_sandbox()
+    }
+
+    pub(crate) fn install_app(&mut self, id: &str) {
+        if !self.custom_install_folders() || self.entry(id).is_some_and(|e| e.installed.is_some()) {
+            self.send(Command::Install { app: id.to_string() });
+            return;
+        }
+        self.dialog =
+            Some(Dialog::Install { app: id.to_string(), folder: self.settings.install_locations.per_app.get(id).cloned().unwrap_or_default() });
+    }
+
+    /// Non-drawing work: runs every frame and also while the window is hidden in the tray.
+    pub fn logic(&mut self, ctx: &egui::Context, host: &mut dyn Host) {
+        set_current(crate::i18n::Lang::from_pref(&self.settings.language));
+        self.configure();
         if !self.started {
             self.started = true;
             self.backend.send(Command::CheckForUpdates { force: false });
@@ -316,13 +360,7 @@ impl LauncherUi {
     fn handle(&mut self, ctx: &egui::Context, event: Event) -> bool {
         match event {
             Event::Latest { app, latest, from } => {
-                if let Some(e) = self.entry_mut(&app) {
-                    // A failed check keeps the release we already know about (and where it came from).
-                    if !(matches!(latest, LatestRelease::Failed(_)) && matches!(e.latest, Some(LatestRelease::Found(_)))) {
-                        e.latest = Some(latest);
-                        e.origin = Some(from);
-                    }
-                }
+                self.on_latest(app, latest, from);
                 true
             }
             Event::Screenshot { app, key, result } => {
@@ -337,14 +375,7 @@ impl LauncherUi {
                 true
             }
             Event::Progress { app, phase } => {
-                if app == artcraft_launcher_core::catalog::LAUNCHER_ID {
-                    self.launcher_job = Some(phase);
-                    if matches!(self.dialog, Some(Dialog::LauncherUpdate(_))) {
-                        self.dialog = None;
-                    }
-                } else if let Some(e) = self.entry_mut(&app) {
-                    e.job = Some(phase);
-                }
+                self.on_progress(app, phase);
                 false
             }
             Event::LauncherRestarting => {
@@ -368,43 +399,15 @@ impl LauncherUi {
                 }
                 false
             }
+            Event::Occupied { app, path } => {
+                self.dialog = Some(Dialog::Replace { app, path });
+                false
+            }
             Event::JobFinished { app, result } => {
-                let launcher = app == artcraft_launcher_core::catalog::LAUNCHER_ID;
-                // What the job was doing when it ended says what a cancellation called off.
-                let last = if launcher { self.launcher_job.take() } else { self.entry(&app).and_then(|e| e.job) };
-                if let Some(e) = self.entry_mut(&app) {
-                    e.job = None;
-                }
-                let kept = self.entry(&app).is_some_and(|e| e.ready);
-                match result {
-                    Ok(msg) => self.toast(ctx, msg, false),
-                    // The paused card says it all.
-                    Err(e) if e == PAUSED => {}
-                    Err(e) if e == CANCELLED && launcher => self.toast(ctx, tl!("Update cancelled"), false),
-                    // An install's own cancellations end as INSTALL_CANCELLED, so past the
-                    // download this is a removal called off while it waited for the installer.
-                    Err(e) if e == CANCELLED && matches!(last, Some(JobPhase::Waiting | JobPhase::Removing)) => {
-                        self.toast(ctx, tl!("Uninstall cancelled"), false);
-                    }
-                    Err(e) if e == CANCELLED => self.toast(ctx, tl!("Download cancelled"), false),
-                    Err(e) if e == INSTALL_CANCELLED && kept => {
-                        self.toast(ctx, tl!("Install cancelled. The download is kept for the next try."), false);
-                    }
-                    Err(e) if e == INSTALL_CANCELLED => self.toast(ctx, tl!("Install cancelled"), false),
-                    Err(e) => self.toast(ctx, e, true),
-                }
+                self.on_job_finished(ctx, app, result);
                 true
             }
-            Event::LauncherUpdate(r) => {
-                let fresh = self.launcher_update.as_ref().is_none_or(|cur| cur.version != r.version);
-                self.launcher_update = Some(r.clone());
-                // Ask once per new version, unless automatic updates will install it anyway.
-                let automatic = self.settings.auto_update && self.caps.self_update;
-                if fresh && !automatic && self.dialog.is_none() && self.launcher_job.is_none() {
-                    self.dialog = Some(Dialog::LauncherUpdate(r));
-                }
-                fresh
-            }
+            Event::LauncherUpdate(r) => self.on_launcher_update(r),
             Event::CheckStarted => {
                 self.checking = true;
                 false
@@ -417,6 +420,71 @@ impl LauncherUi {
                 true
             }
         }
+    }
+
+    // A failed check keeps the release we already know about (and where it came from).
+    fn on_latest(&mut self, app: String, latest: LatestRelease, from: artcraft_launcher_core::protocol::Origin) {
+        if let Some(e) = self.entry_mut(&app)
+            && !(matches!(latest, LatestRelease::Failed(_)) && matches!(e.latest, Some(LatestRelease::Found(_))))
+        {
+            e.latest = Some(latest);
+            e.origin = Some(from);
+        }
+    }
+
+    // Routes a job phase to the launcher's own slot or to the app card it belongs to.
+    fn on_progress(&mut self, app: String, phase: JobPhase) {
+        if app == artcraft_launcher_core::catalog::LAUNCHER_ID {
+            self.launcher_job = Some(phase);
+            if matches!(self.dialog, Some(Dialog::LauncherUpdate(_))) {
+                self.dialog = None;
+            }
+        } else if let Some(e) = self.entry_mut(&app) {
+            e.job = Some(phase);
+        }
+    }
+
+    /// Summarizes a job's end as a toast; cancellations have their own messages.
+    fn on_job_finished(&mut self, ctx: &egui::Context, app: String, result: Result<String, String>) {
+        let launcher = app == artcraft_launcher_core::catalog::LAUNCHER_ID;
+        // What the job was doing when it ended says what a cancellation called off.
+        let last = if launcher { self.launcher_job.take() } else { self.entry(&app).and_then(|e| e.job) };
+        if let Some(e) = self.entry_mut(&app) {
+            e.job = None;
+        }
+        let kept = self.entry(&app).is_some_and(|e| e.ready);
+        match result {
+            Ok(msg) => self.toast(ctx, msg, false),
+            // The paused card says it all.
+            Err(e) if e == PAUSED => {}
+            Err(e) if e == CANCELLED && launcher => self.toast(ctx, tl!("Update cancelled"), false),
+            // An install's own cancellations end as INSTALL_CANCELLED, so past the
+            // download this is a removal called off while it waited for the installer.
+            Err(e) if e == CANCELLED && matches!(last, Some(JobPhase::Waiting | JobPhase::Removing)) => {
+                self.toast(ctx, tl!("Uninstall cancelled"), false);
+            }
+            Err(e) if e == CANCELLED => self.toast(ctx, tl!("Download cancelled"), false),
+            Err(e) if e == INSTALL_CANCELLED && kept => {
+                self.toast(ctx, tl!("Install cancelled. The download is kept for the next try."), false);
+            }
+            Err(e) if e == INSTALL_CANCELLED => self.toast(ctx, tl!("Install cancelled"), false),
+            // The Replace dialog says it all.
+            Err(_) if matches!(&self.dialog, Some(Dialog::Replace { app: a, .. }) if *a == app) => {}
+            Err(e) => self.toast(ctx, e, true),
+        }
+    }
+
+    /// Offers the launcher's own update once per new version, unless automatic updates install it.
+    fn on_launcher_update(&mut self, r: Release) -> bool {
+        // Whether the launcher can replace itself is only known once an update is found.
+        self.caps = self.backend.capabilities();
+        let fresh = self.launcher_update.as_ref().is_none_or(|cur| cur.version != r.version);
+        self.launcher_update = Some(r.clone());
+        let automatic = self.settings.auto_update && self.caps.self_update;
+        if fresh && !automatic && self.dialog.is_none() && self.launcher_job.is_none() {
+            self.dialog = Some(Dialog::LauncherUpdate(r));
+        }
+        fresh
     }
 
     /// One notification per new version of an installed app.
@@ -485,9 +553,35 @@ impl LauncherUi {
         }
     }
 
+    fn zoom_input(&mut self, ctx: &egui::Context) {
+        use egui::gui_zoom::kb_shortcuts;
+        let notes_open = matches!(self.dialog, Some(Dialog::Notes(_)));
+        let (delta, zoom_in, zoom_out, reset) = ctx.input_mut(|i| {
+            let delta = i.zoom_delta();
+            let reset = notes_open && i.consume_shortcut(&kb_shortcuts::ZOOM_RESET);
+            let zoom_in = notes_open && (i.consume_shortcut(&kb_shortcuts::ZOOM_IN) || i.consume_shortcut(&kb_shortcuts::ZOOM_IN_SECONDARY));
+            let zoom_out = notes_open && i.consume_shortcut(&kb_shortcuts::ZOOM_OUT);
+            (delta, zoom_in, zoom_out, reset)
+        });
+        let delta = if delta.is_finite() && delta > 0.0 { delta } else { 1.0 };
+        if notes_open {
+            let step = match (zoom_in, zoom_out) {
+                (true, false) => 0.1,
+                (false, true) => -0.1,
+                _ => 0.0,
+            };
+            self.notes_zoom = if reset { 1.0 } else { ((self.notes_zoom + step) * delta).clamp(0.5, 3.0) };
+        } else if delta != 1.0 {
+            ctx.set_zoom_factor((ctx.zoom_factor() * delta).clamp(0.2, 5.0));
+        }
+    }
+
     /// Draws the launcher.
     pub fn ui(&mut self, ui: &mut egui::Ui, host: &mut dyn Host) {
         let ctx = ui.ctx().clone();
+        if host.title_bar() == TitleBar::MacOs && ctx.input_mut(|i| i.consume_key(egui::Modifiers::MAC_CMD, egui::Key::M)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         // Set the current language for this frame based on settings.
         let lang = effective_lang(&self.settings.language);
         set_current(lang);
@@ -502,6 +596,7 @@ impl LauncherUi {
             ctx.request_repaint();
             return;
         }
+        self.zoom_input(&ctx);
         if self.applied_theme != Some(self.settings.theme) {
             theme::apply(&ctx, self.settings.theme);
             self.applied_theme = Some(self.settings.theme);
@@ -515,6 +610,7 @@ impl LauncherUi {
             motion::apply(&ctx, self.reduce_motion);
             self.applied_motion = Some(self.reduce_motion);
         }
+        self.discord_url = host.discord_url();
         let tokens = Tokens::get(&ctx);
         if self.entries.iter().any(|e| e.job.is_some()) || self.checking {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -579,7 +675,9 @@ impl LauncherUi {
             .collect();
         let platform = self.platform;
         let manage = self.caps.manage_apps;
-        let desc = self.settings.sort_descending;
+        // The grid offers its own few orders (`views::grid_sort_now`); the table sorts by its columns.
+        let grid = self.settings.view == ViewMode::Grid;
+        let (sort, desc) = if grid { crate::views::grid_sort_now(&self.settings) } else { (self.settings.sort, self.settings.sort_descending) };
         let dir = |o: std::cmp::Ordering| if desc { o.reverse() } else { o };
         // Empty cells (not installed, no release) go last whichever way the column sorts.
         let opt = |a: Option<std::cmp::Ordering>, a_some: bool, b_some: bool| match (a_some, b_some) {
@@ -591,7 +689,7 @@ impl LauncherUi {
         let installed = |e: &AppEntry| e.installed.as_ref().and_then(|i| i.version.clone());
         let latest = |e: &AppEntry| e.release().and_then(|r| r.version.clone());
         list.sort_by(|(ia, a), (ib, b)| {
-            let ord = match self.settings.sort {
+            let ord = match sort {
                 SortKey::Suite => dir(ia.cmp(ib)),
                 SortKey::Name => dir(a.app.name.cmp(b.app.name)),
                 SortKey::Status => {
@@ -605,6 +703,10 @@ impl LauncherUi {
                     let (x, y) = (latest(a), latest(b));
                     opt(x.as_ref().zip(y.as_ref()).map(|(x, y)| x.cmp_precedence(y)), x.is_some(), y.is_some())
                 }
+                SortKey::Frequent => {
+                    let opened = |e: &AppEntry| self.settings.launches.get(e.app.id).copied().unwrap_or(0);
+                    dir(opened(a).cmp(&opened(b)))
+                }
                 SortKey::Released => {
                     let at = |e: &AppEntry| e.release().and_then(|r| r.published_at);
                     let (x, y) = (at(a), at(b));
@@ -614,7 +716,24 @@ impl LauncherUi {
             // Ties keep suite order.
             ord.then(ia.cmp(ib))
         });
+        // The grid shows installed apps first, then the rest under "Not installed" (the sort holds
+        // within each group; the sort is stable). The table keeps the order its column gives.
+        if grid {
+            list.sort_by_key(|(_, e)| !e.status(platform, manage).is_installed());
+        }
         list.into_iter().map(|(_, e)| e.app.id).collect()
+    }
+
+    /// Opens an app, and counts it for "Frequently used".
+    pub(crate) fn launch_app(&mut self, id: &str) {
+        let opened = self.settings.launches.entry(id.to_string()).or_insert(0);
+        *opened = opened.saturating_add(1);
+        self.send(Command::Launch { app: id.to_string() });
+    }
+
+    /// Whether the app on screen under `id` is installed on this computer.
+    pub(crate) fn is_installed(&self, id: &str) -> bool {
+        self.entry(id).is_some_and(|e| e.status(self.platform, self.caps.manage_apps).is_installed())
     }
 
     /// "ArtCraft API", "GitHub" or "ArtCraft API and GitHub": the services behind the releases on
